@@ -3,67 +3,64 @@ package signedurl
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"fmt"
 	"hash"
 	"net/http"
-	"strconv"
+	"net/http/httptest"
+	"net/url"
+	"testing"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
 
-func init() {
-	caddy.RegisterModule(SignedURL{})
-	httpcaddyfile.RegisterHandlerDirective("signed_url", parseCaddyfile)
+// Helper function to create a signature
+func createSignature(secret, data string) string {
+	return createSignatureWithAlgorithm(secret, data, sha256.New)
 }
 
-// SignedURL implements an HTTP handler that validates HMAC signatures
-type SignedURL struct {
-	// Secret key for HMAC signing
-	Secret string `json:"secret,omitempty"`
-
-	// Algorithm is the hash algorithm to use (default: "sha256")
-	// Supported: sha256, sha384, sha512
-	Algorithm string `json:"algorithm,omitempty"`
-
-	// QueryParam is the query parameter name for the signature (default: "signature")
-	QueryParam string `json:"query_param,omitempty"`
-
-	// Header is the HTTP header name for the signature (default: "X-Signature")
-	Header string `json:"header,omitempty"`
-
-	// ExpiresParam is the query parameter name for expiration timestamp (default: "expires")
-	ExpiresParam string `json:"expires_param,omitempty"`
-
-	// IssuedParam is the query parameter name for issued/generated timestamp (default: "issued")
-	IssuedParam string `json:"issued_param,omitempty"`
-
-	logger   *zap.Logger
-	hashFunc func() hash.Hash
+// Helper function to create a signature with specific algorithm
+func createSignatureWithAlgorithm(secret, data string, hashFunc func() hash.Hash) string {
+	h := hmac.New(hashFunc, []byte(secret))
+	h.Write([]byte(data))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
-// CaddyModule returns the Caddy module information
-func (SignedURL) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "http.handlers.signed_url",
-		New: func() caddy.Module { return new(SignedURL) },
-	}
+// Mock next handler that returns 200 OK
+type mockHandler struct{}
+
+func (m mockHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("success"))
+	return nil
 }
 
-// Provision implements caddy.Provisioner
-func (s *SignedURL) Provision(ctx caddy.Context) error {
-	s.logger = ctx.Logger(s)
+// Setup helper
+func setupHandler(secret string) *SignedURL {
+	return setupHandlerWithAlgorithm(secret, "sha256")
+}
 
-	if s.Secret == "" {
-		return fmt.Errorf("secret is required for signed URL")
+// Setup helper with algorithm
+func setupHandlerWithAlgorithm(secret, algorithm string) *SignedURL {
+	s := &SignedURL{
+		Secret:    secret,
+		Algorithm: algorithm,
+		logger:    zap.NewNop(), // Use no-op logger for tests
 	}
 
-	// Set defaults
+	// Set hash function based on algorithm
+	switch algorithm {
+	case "sha256":
+		s.hashFunc = sha256.New
+	case "sha384":
+		s.hashFunc = sha512.New384
+	case "sha512":
+		s.hashFunc = sha512.New
+	}
+
+	// Set defaults manually since we're skipping full Provision
 	if s.QueryParam == "" {
 		s.QueryParam = "signature"
 	}
@@ -76,212 +73,298 @@ func (s *SignedURL) Provision(ctx caddy.Context) error {
 	if s.IssuedParam == "" {
 		s.IssuedParam = "issued"
 	}
-
-	s.logger.Info("signed_url handler provisioned",
-		zap.String("query_param", s.QueryParam),
-		zap.String("header", s.Header),
-		zap.String("expires_param", s.ExpiresParam),
-		zap.String("issued_param", s.IssuedParam),
-	)
-
-	return nil
+	return s
 }
 
-// Validate implements caddy.Validator
-func (s *SignedURL) Validate() error {
-	if s.Secret == "" {
-		return fmt.Errorf("secret cannot be empty")
+func TestSignedURL_ValidSignature(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	signature := createSignature(secret, path)
+
+	req := httptest.NewRequest("GET", path+"?signature="+signature, nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	return nil
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
 }
 
-// ServeHTTP implements caddyhttp.MiddlewareHandler
-func (s SignedURL) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	// Extract signature from query param or header
-	signature := r.URL.Query().Get(s.QueryParam)
-	signatureSource := "query"
-	if signature == "" {
-		signature = r.Header.Get(s.Header)
-		signatureSource = "header"
+func TestSignedURL_InvalidSignature(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+
+	req := httptest.NewRequest("GET", path+"?signature=invalid", nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if signature == "" {
-		s.logger.Warn("missing signature",
-			zap.String("path", r.URL.Path),
-			zap.String("remote_addr", r.RemoteAddr),
-		)
-		http.Error(w, "Missing signature", http.StatusUnauthorized)
-		return nil
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
 	}
-
-	now := time.Now().Unix()
-
-	// Parse issued timestamp if present (for logging/audit purposes only)
-	var issuedAt int64
-	issuedStr := r.URL.Query().Get(s.IssuedParam)
-	if issuedStr != "" {
-		var err error
-		issuedAt, err = strconv.ParseInt(issuedStr, 10, 64)
-		if err != nil {
-			s.logger.Warn("invalid issued parameter",
-				zap.String("path", r.URL.Path),
-				zap.String("issued", issuedStr),
-				zap.Error(err),
-			)
-			http.Error(w, "Invalid issued parameter", http.StatusBadRequest)
-			return nil
-		}
-	}
-
-	// Check expiration timestamp if present
-	expiresStr := r.URL.Query().Get(s.ExpiresParam)
-	if expiresStr != "" {
-		expiresAt, err := strconv.ParseInt(expiresStr, 10, 64)
-		if err != nil {
-			s.logger.Warn("invalid expires parameter",
-				zap.String("path", r.URL.Path),
-				zap.String("expires", expiresStr),
-				zap.Error(err),
-			)
-			http.Error(w, "Invalid expires parameter", http.StatusBadRequest)
-			return nil
-		}
-
-		// Check if URL has expired
-		if now > expiresAt {
-			s.logger.Warn("url expired",
-				zap.String("path", r.URL.Path),
-				zap.Int64("expired_at", expiresAt),
-				zap.Int64("current_time", now),
-				zap.Int64("expired_by", now-expiresAt),
-			)
-			http.Error(w, "URL has expired", http.StatusUnauthorized)
-			return nil
-		}
-	}
-
-	// Build the string to sign (full path including query params minus the signature)
-	// Query parameters are sorted to ensure consistent ordering
-	query := r.URL.Query()
-	query.Del(s.QueryParam)
-
-	var toSign string
-	if len(query) > 0 {
-		// Encode() automatically sorts keys alphabetically for consistent signatures
-		toSign = r.URL.Path + "?" + query.Encode()
-	} else {
-		toSign = r.URL.Path
-	}
-
-	// Calculate expected signature
-	expectedSig := s.calculateSignature(toSign)
-
-	// Compare signatures (constant time comparison)
-	if !hmac.Equal([]byte(signature), []byte(expectedSig)) {
-		s.logger.Warn("invalid signature",
-			zap.String("path", r.URL.Path),
-			zap.String("signature_source", signatureSource),
-			zap.String("remote_addr", r.RemoteAddr),
-		)
-		http.Error(w, "Invalid signature", http.StatusUnauthorized)
-		return nil
-	}
-
-	// Signature is valid, continue to next handler
-	logFields := []zap.Field{
-		zap.String("path", r.URL.Path),
-		zap.String("signature_source", signatureSource),
-	}
-	if issuedAt > 0 {
-		logFields = append(logFields,
-			zap.Int64("issued_at", issuedAt),
-			zap.Int64("age_seconds", now-issuedAt),
-		)
-	}
-	if expiresStr != "" {
-		expiresAt, _ := strconv.ParseInt(expiresStr, 10, 64)
-		logFields = append(logFields,
-			zap.Int64("expires_at", expiresAt),
-			zap.Int64("ttl_seconds", expiresAt-now),
-		)
-	}
-	s.logger.Debug("signature validated successfully", logFields...)
-
-	return next.ServeHTTP(w, r)
 }
 
-// calculateSignature generates HMAC-SHA256 signature
-func (s *SignedURL) calculateSignature(data string) string {
-	h := hmac.New(sha256.New, []byte(s.Secret))
-	h.Write([]byte(data))
-	return hex.EncodeToString(h.Sum(nil))
+func TestSignedURL_MissingSignature(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	req := httptest.NewRequest("GET", "/test/file.pdf", nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
 }
 
-// UnmarshalCaddyfile implements caddyfile.Unmarshaler
-func (s *SignedURL) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		// Check for inline secret: signed_url "value"
-		if d.NextArg() {
-			s.Secret = d.Val()
-			// No more args expected in inline form
-			if d.NextArg() {
-				return d.ArgErr()
+func TestSignedURL_SignatureInHeader(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	signature := createSignature(secret, path)
+
+	req := httptest.NewRequest("GET", path, nil)
+	req.Header.Set("X-Signature", signature)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func TestSignedURL_WithExpires_NotExpired(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	expires := time.Now().Unix() + 3600 // 1 hour from now
+
+	toSign := fmt.Sprintf("%s?expires=%d", path, expires)
+	signature := createSignature(secret, toSign)
+
+	reqURL := fmt.Sprintf("%s?expires=%d&signature=%s", path, expires, signature)
+	req := httptest.NewRequest("GET", reqURL, nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func TestSignedURL_WithExpires_Expired(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	expires := time.Now().Unix() - 3600 // 1 hour ago
+
+	toSign := fmt.Sprintf("%s?expires=%d", path, expires)
+	signature := createSignature(secret, toSign)
+
+	reqURL := fmt.Sprintf("%s?expires=%d&signature=%s", path, expires, signature)
+	req := httptest.NewRequest("GET", reqURL, nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected status 401, got %d", w.Code)
+	}
+
+	body := w.Body.String()
+	if body != "URL has expired\n" {
+		t.Errorf("expected 'URL has expired' message, got %s", body)
+	}
+}
+
+func TestSignedURL_WithIssued(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	issued := time.Now().Unix() - 60 // 1 minute ago
+	expires := time.Now().Unix() + 3600
+
+	// Build query with sorted params
+	query := url.Values{}
+	query.Set("expires", fmt.Sprintf("%d", expires))
+	query.Set("issued", fmt.Sprintf("%d", issued))
+
+	toSign := path + "?" + query.Encode()
+	signature := createSignature(secret, toSign)
+
+	query.Set("signature", signature)
+	reqURL := path + "?" + query.Encode()
+
+	req := httptest.NewRequest("GET", reqURL, nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func TestSignedURL_QueryParamOrdering(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	issued := time.Now().Unix()
+	expires := time.Now().Unix() + 3600
+
+	// Create signature with sorted params
+	query := url.Values{}
+	query.Set("expires", fmt.Sprintf("%d", expires))
+	query.Set("issued", fmt.Sprintf("%d", issued))
+	query.Set("foo", "bar")
+
+	toSign := path + "?" + query.Encode()
+	signature := createSignature(secret, toSign)
+
+	// Test multiple different orderings - all should work
+	testCases := []string{
+		fmt.Sprintf("%s?expires=%d&issued=%d&foo=bar&signature=%s", path, expires, issued, signature),
+		fmt.Sprintf("%s?issued=%d&expires=%d&foo=bar&signature=%s", path, issued, expires, signature),
+		fmt.Sprintf("%s?foo=bar&expires=%d&issued=%d&signature=%s", path, expires, issued, signature),
+		fmt.Sprintf("%s?signature=%s&foo=bar&issued=%d&expires=%d", path, signature, issued, expires),
+	}
+
+	for i, testURL := range testCases {
+		t.Run(fmt.Sprintf("ordering_%d", i), func(t *testing.T) {
+			req := httptest.NewRequest("GET", testURL, nil)
+			w := httptest.NewRecorder()
+
+			err := handler.ServeHTTP(w, req, mockHandler{})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-			continue
-		}
 
-		// Block form: signed_url { ... }
-		for d.NextBlock(0) {
-			switch d.Val() {
-			case "secret":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				s.Secret = d.Val()
-
-			case "query_param":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				s.QueryParam = d.Val()
-
-			case "header":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				s.Header = d.Val()
-
-			case "expires_param":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				s.ExpiresParam = d.Val()
-
-			case "issued_param":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				s.IssuedParam = d.Val()
-
-			default:
-				return d.Errf("unrecognized subdirective: %s", d.Val())
+			if w.Code != http.StatusOK {
+				t.Errorf("expected status 200 for URL %s, got %d: %s", testURL, w.Code, w.Body.String())
 			}
-		}
+		})
 	}
-	return nil
 }
 
-// parseCaddyfile unmarshals tokens from h into a new Middleware
-func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var s SignedURL
-	err := s.UnmarshalCaddyfile(h.Dispenser)
-	return s, err
+func TestSignedURL_InvalidExpiresFormat(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+
+	req := httptest.NewRequest("GET", path+"?expires=invalid&signature=test", nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
 }
 
-// Interface guards
-var (
-	_ caddy.Provisioner           = (*SignedURL)(nil)
-	_ caddy.Validator             = (*SignedURL)(nil)
-	_ caddyhttp.MiddlewareHandler = (*SignedURL)(nil)
-	_ caddyfile.Unmarshaler       = (*SignedURL)(nil)
-)
+func TestSignedURL_InvalidIssuedFormat(t *testing.T) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+
+	req := httptest.NewRequest("GET", path+"?issued=invalid&signature=test", nil)
+	w := httptest.NewRecorder()
+
+	err := handler.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status 400, got %d", w.Code)
+	}
+}
+
+func TestSignedURL_CustomParamNames(t *testing.T) {
+	s := &SignedURL{
+		Secret:       "test-secret",
+		QueryParam:   "sig",
+		ExpiresParam: "exp",
+		IssuedParam:  "iat",
+		Header:       "X-Signature",
+		logger:       zap.NewNop(),
+	}
+
+	path := "/test/file.pdf"
+	expires := time.Now().Unix() + 3600
+
+	query := url.Values{}
+	query.Set("exp", fmt.Sprintf("%d", expires))
+
+	toSign := path + "?" + query.Encode()
+	signature := createSignature(s.Secret, toSign)
+
+	query.Set("sig", signature)
+	reqURL := path + "?" + query.Encode()
+
+	req := httptest.NewRequest("GET", reqURL, nil)
+	w := httptest.NewRecorder()
+
+	err := s.ServeHTTP(w, req, mockHandler{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+}
+
+func BenchmarkSignedURL_ValidSignature(b *testing.B) {
+	secret := "test-secret"
+	handler := setupHandler(secret)
+
+	path := "/test/file.pdf"
+	signature := createSignature(secret, path)
+
+	req := httptest.NewRequest("GET", path+"?signature="+signature, nil)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req, mockHandler{})
+	}
+}
